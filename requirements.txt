@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+opencv-python
+numpy
+ultralytics
+torch
+torchvision
+torchaudio
+pillow
+paddleocr
+paddlepaddle
+python-multipart
+pydantic
+requests
+scipy
+matplotlib
