@@ -1,0 +1,25 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+
+.env
+
+
+.vscode/
+
+.DS_Store
+Thumbs.db
+
+
+build/
+dist/
+*.egg-info/
