@@ -1,75 +1,44 @@
-import cv2
-from yolo_model import detect_objects
+from detection.yolo_model import detect_general, detect_helmet
 
 
-video_path = r"C:\Users\TEJAS\OneDrive\Desktop\Miniproject\test.mp4"
-
-cap = cv2.VideoCapture(video_path)
-
-frame_count = 0
-skip_frames = 3   
-
-while True:
-    ret, frame = cap.read()
-
-    if not ret:
-        break
-
-
-    frame_count += 1
-
-
-    if frame_count % skip_frames != 0:
-        continue
-
-
-    results = detect_objects(frame)
-
+def detect_general_objects(frame):
+    results    = detect_general(frame)
+    detections = []
 
     for r in results:
-
-        boxes = r.boxes
-
-        if boxes is None:
+        if r.boxes is None:
             continue
-
-        for box in boxes:
-
+        for box in r.boxes:
             x1, y1, x2, y2 = box.xyxy[0]
 
-            x1 = int(x1)
-            y1 = int(y1)
-            x2 = int(x2)
-            y2 = int(y2)
+            # Get track_id from ByteTrack
+            track_id = int(box.id[0]) if box.id is not None else -1
 
-            conf = float(box.conf[0])
-            cls = int(box.cls[0])
+            detections.append({
+                "class"   : int(box.cls[0]),
+                "conf"    : float(box.conf[0]),
+                "box"     : (int(x1), int(y1), int(x2), int(y2)),
+                "track_id": track_id
+            })
 
-            label = f"{cls} {conf:.2f}"
-
-            cv2.rectangle(
-                frame,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2
-            )
-
-            cv2.putText(
-                frame,
-                label,
-                (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                2
-            )
+    return detections
 
 
-    cv2.imshow("Video Detection", frame)
+def detect_helmet_objects(frame):
+    results    = detect_helmet(frame)
+    detections = []
 
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
+    for r in results:
+        if r.boxes is None:
+            continue
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0]
 
-cap.release()
-cv2.destroyAllWindows()
+            detections.append({
+                "class"   : int(box.cls[0]),
+                "conf"    : float(box.conf[0]),
+                "box"     : (int(x1), int(y1), int(x2), int(y2)),
+                "track_id": -1   # helmet model has no tracker
+            })
+
+    return detections
