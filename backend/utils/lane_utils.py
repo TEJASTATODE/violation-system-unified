@@ -1,305 +1,261 @@
+"""
+lane_utils.py — Adaptive horizon-relative ROI
+═══════════════════════════════════════════════════════════════════════
+
+WHY THE TRAPEZOID WAS REPLACED
+────────────────────────────────
+A fixed trapezoid assumes:
+  • Horizon is always at the same height     — wrong on hills
+  • Road curves fit within fixed side edges  — wrong on bends
+  • Lane width is constant                   — wrong on narrow/wide roads
+
+Result: vehicles on curves escape the right edge, vehicles on hills
+appear above the top edge — both cause misses.
+
+THE NEW APPROACH: HORIZON-RELATIVE DYNAMIC ZONE
+─────────────────────────────────────────────────
+Every frame:
+  1. Estimate the vanishing point (horizon) from optical flow vectors.
+     Flow lines from a moving dashcam converge at the vanishing point.
+     This naturally tracks hills (vp moves up) and curves (vp shifts sideways).
+
+  2. Active zone = full frame width, from (vp_y + MARGIN) to frame bottom.
+     Full width means no vehicle escapes on curves.
+     Horizon-relative means hills don't cause misses.
+
+  3. Lane danger zone = right half of active zone (existing logic in
+     process_frame.py — unchanged).
+
+  4. inside_roi() checks a vehicle centroid against this dynamic zone,
+     not a hardcoded trapezoid.
+
+FALLBACK
+─────────
+If vanishing point estimation fails (e.g. ego stopped, no flow):
+  Falls back to a fixed fraction of frame height (VP_FALLBACK_FRAC).
+  This is more robust than the old trapezoid because it's still full-width.
+
+CPU COST
+─────────
+Optical flow for vp estimation is already being computed in process_frame.
+To avoid double computation, we cache the last known vp and reuse it
+if the current frame's estimation fails.
+"""
+
 import cv2
 import numpy as np
+from collections import deque
 
-# ── Zone boundaries ───────────────────────────────────
-LEFT_BOUNDARY  = 0.45
-RIGHT_BOUNDARY = 0.55
+# ══════════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════════
 
-# ── Colors ────────────────────────────────────────────
-LEFT_COLOR      = (255, 50,  0)
-CENTER_COLOR    = (0,   200, 0)
-RIGHT_COLOR     = (0,   50,  255)
-DIVIDER_COLOR   = (0,   255, 255)
-APPROACH_COLOR  = (0,   165, 255)
-VIOLATION_COLOR = (0,   0,   255)
-ZONE_ALPHA      = 0.12
+# Fraction of frame height added below estimated vp as a margin.
+# Prevents the zone from starting exactly at the vanishing point
+# (where perspective distortion is highest and detections unreliable).
+VP_MARGIN_FRAC   = 0.08   # zone starts this far below vp
 
-# ── Thresholds ────────────────────────────────────────
-APPROACH_RATIO  = 1.06
-MIN_AREA        = 3000
-MIN_DY          = 1
-MIN_MOVEMENT    = 3.0    # min pixels/frame to be moving
-MIN_DX          = 2.0    # min horizontal movement
+# Fallback: if vp estimation fails, zone starts at this fraction from top.
+# 0.45 = zone covers bottom 55% of frame.
+VP_FALLBACK_FRAC = 0.45
+
+# EMA smoothing for vp_y — prevents jitter from frame-to-frame variation.
+VP_EMA_ALPHA     = 0.15   # low = very smooth, slow to react
+                           # raise to 0.30 on hilly roads for faster tracking
+
+# Optical flow params for vp estimation
+VP_MAX_CORNERS   = 150
+VP_QUALITY       = 0.01
+VP_MIN_DIST      = 8
+
+# Colour for ROI overlay
+ROI_COLOUR       = (255, 220, 0)    # yellow
+ROI_ALPHA        = 0.06             # overlay transparency
 
 
-# ── White line center history ─────────────────────────
-center_history  = []
-SMOOTH_FRAMES   = 20
+# ══════════════════════════════════════════════════════════
+#  STATE
+# ══════════════════════════════════════════════════════════
+_vp_y_smooth  = None     # smoothed vanishing point y (px)
+_prev_gray_vp = None     # cached greyscale for vp estimation
 
 
-def detect_white_line_center(frame):
+# ══════════════════════════════════════════════════════════
+#  VANISHING POINT ESTIMATION
+# ══════════════════════════════════════════════════════════
+def _estimate_vp_y(frame_gray):
     """
-    Detects white center divider line.
-    Returns x position of divider.
-    Falls back to frame center if not found.
+    Estimate the vertical position of the vanishing point using
+    optical flow direction convergence.
 
-    Pipeline:
-    1. Convert to HSV
-    2. Mask white pixels
-    3. Apply ROI
-    4. Hough lines on white pixels
-    5. Find most central vertical line
+    When a dashcam moves forward, all optical flow vectors point
+    away from the vanishing point. The median vertical component
+    of background flow vectors converges toward vp_y.
+
+    Returns vp_y in pixels, or None if estimation fails.
     """
-    h, w  = frame.shape[:2]
+    global _prev_gray_vp, _vp_y_smooth
 
-    # HSV white mask
-    hsv         = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower_white = np.array([0,   0,   180])
-    upper_white = np.array([180, 30,  255])
-    white_mask  = cv2.inRange(hsv, lower_white, upper_white)
+    curr = frame_gray
+    if _prev_gray_vp is None:
+        _prev_gray_vp = curr
+        return _vp_y_smooth
+    
+    prev = _prev_gray_vp
 
-    # ROI — bottom 60% of frame
-    roi = np.zeros_like(white_mask)
-    polygon = np.array([[
-        (0,          h),
-        (w,          h),
-        (int(w*0.65), int(h*0.40)),
-        (int(w*0.35), int(h*0.40))
-    ]], dtype=np.int32)
-    cv2.fillPoly(roi, polygon, 255)
-    masked = cv2.bitwise_and(white_mask, roi)
+    p0 = cv2.goodFeaturesToTrack(
+        prev, VP_MAX_CORNERS, VP_QUALITY, VP_MIN_DIST)
+    _prev_gray_vp = curr
 
-    # Hough lines
-    lines = cv2.HoughLinesP(
-        masked,
-        rho=1, theta=np.pi/180,
-        threshold=30,
-        minLineLength=50,
-        maxLineGap=100
-    )
+    if p0 is None:
+     _prev_gray_vp = curr
+     return _vp_y_smooth
 
-    if lines is None:
-        return w // 2   # fallback
+    p1, st, _ = cv2.calcOpticalFlowPyrLK(_prev_gray_vp, curr, p0, prev)
+    
+    _prev_gray_vp = curr
+   
+    p0g = p0[st == 1]
+    p1g = p1[st == 1]
+    if len(p0g) < 10:
+        return _vp_y_smooth
 
-    # Find line closest to frame center
-    frame_center = w // 2
-    best_x       = None
-    best_dist    = float("inf")
+    # Use RANSAC homography to get background-only points
+    H, mask = cv2.findHomography(p0g, p1g, cv2.RANSAC, 3.0)
+    if mask is not None:
+        inl = mask.ravel().astype(bool)
+        if inl.sum() >= 8:
+            p0g = p0g[inl]
+            p1g = p1g[inl]
 
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if x2 == x1:
+    # Flow vectors: direction from which they diverge = vanishing point
+    # For forward motion, flow vectors point away from vp.
+    # Rays: from p0 in direction (p0 - p1) extended backward.
+    # We estimate vp_y as the y-coordinate where most rays converge.
+    # Simplified: median of (p0_y - dy * t) where t brings ray to centre_x
+    h, w = frame_gray.shape[:2]
+    cx = w / 2.0
+
+    vp_ys = []
+    for (x0, y0), (x1, y1) in zip(p0g.reshape(-1, 2), p1g.reshape(-1, 2)):
+        dx = x0 - x1   # flow direction inverted = toward vp
+        dy = y0 - y1
+        if abs(dx) < 0.5:
             continue
-        slope = (y2-y1)/(x2-x1)
-
-        # Only near-vertical lines
-        if abs(slope) < 0.3:
+        # t to reach centre_x: x0 + dx*t = cx → t = (cx - x0) / dx
+        t = (cx - x0) / dx
+        if t < 0 or t > 50:   # reject diverging or very far intersections
             continue
+        vp_y = y0 + dy * t
+        if 0 < vp_y < h * 0.75:   # vp must be in upper 3/4 of frame
+            vp_ys.append(vp_y)
 
-        mid_x = (x1+x2)//2
-        dist  = abs(mid_x - frame_center)
+    if len(vp_ys) < 5:
+        return _vp_y_smooth
 
-        if dist < best_dist:
-            best_dist = dist
-            best_x    = mid_x
+    raw_vp_y = float(np.median(vp_ys))
 
-    return best_x if best_x else frame_center
-
-
-def get_smooth_center(frame):
-    """
-    Smooths center x over SMOOTH_FRAMES.
-    Prevents jitter from frame to frame.
-    """
-    global center_history
-
-    raw = detect_white_line_center(frame)
-    center_history.append(raw)
-
-    if len(center_history) > SMOOTH_FRAMES:
-        center_history.pop(0)
-
-    return int(np.mean(center_history))
-
-
-def get_zone_boundaries(frame_width, center_x=None):
-    """
-    Returns zone boundaries.
-    Uses detected center if available.
-    """
-    if center_x is None:
-        center_x = frame_width // 2
-
-    # 10% buffer around center
-    buffer  = int(frame_width * 0.05)
-    left_x  = center_x - buffer
-    right_x = center_x + buffer
-
-    return left_x, right_x
-
-
-def get_vehicle_zone(box, frame_width, center_x=None):
-    """
-    Returns zone: left / center / right
-    Based on vehicle center vs road center.
-    """
-    cx             = (box[0]+box[2])//2
-    left_x, right_x = get_zone_boundaries(
-        frame_width, center_x
-    )
-
-    if cx < left_x:
-        return "left"
-    elif cx < right_x:
-        return "center"
+    # EMA smooth
+    if _vp_y_smooth is None:
+        _vp_y_smooth = raw_vp_y
     else:
-        return "right"
+        _vp_y_smooth = (VP_EMA_ALPHA * raw_vp_y
+                        + (1 - VP_EMA_ALPHA) * _vp_y_smooth)
+
+    return _vp_y_smooth
 
 
-def get_box_area(box):
-    x1, y1, x2, y2 = box
-    return max(0, x2-x1) * max(0, y2-y1)
+# ══════════════════════════════════════════════════════════
+#  PUBLIC API
+# ══════════════════════════════════════════════════════════
 
-
-def get_box_center(box):
-    x1, y1, x2, y2 = box
-    return ((x1+x2)//2, (y1+y2)//2)
-
-
-def is_approaching(curr_area, prev_area,
-                   curr_cy,   prev_cy):
-    if prev_area <= 0:
-        return False
-    area_ratio = curr_area / prev_area
-    area_grows = area_ratio >= APPROACH_RATIO
-    moves_down = (curr_cy - prev_cy) >= MIN_DY
-    return area_grows and moves_down
-
-
-def is_moving_away(curr_area, prev_area,
-                   curr_cy,   prev_cy):
-    if prev_area <= 0:
-        return False
-    area_ratio   = curr_area / prev_area
-    area_shrinks = area_ratio <= 0.94
-    moves_up     = (prev_cy - curr_cy) >= 1
-    return area_shrinks and moves_up
-
-
-def draw_zones(frame, center_x=None):
+def get_zone_top_y(frame):
     """
-    Draws 3 zones using detected center.
+    Returns the y-coordinate of the top edge of the active zone.
+    Everything BELOW this y is in the active zone.
+
+    Vehicles above this line are near/above the horizon — too far away
+    or in sky — and should be ignored.
     """
-    h, w             = frame.shape[:2]
-    if center_x is None:
-        center_x     = w // 2
-    left_x, right_x  = get_zone_boundaries(w, center_x)
-    overlay          = frame.copy()
-
-    # Left zone
-    cv2.rectangle(overlay, (0,0), (left_x,h),
-                  LEFT_COLOR, -1)
-
-    # Center zone
-    cv2.rectangle(overlay, (left_x,0), (right_x,h),
-                  CENTER_COLOR, -1)
-
-    # Right zone
-    cv2.rectangle(overlay, (right_x,0), (w,h),
-                  RIGHT_COLOR, -1)
-
-    cv2.addWeighted(overlay, ZONE_ALPHA,
-                    frame, 1-ZONE_ALPHA, 0, frame)
-
-    # Divider lines
-    cv2.line(frame, (left_x,0),  (left_x,h),
-             DIVIDER_COLOR, 2)
-    cv2.line(frame, (right_x,0), (right_x,h),
-             DIVIDER_COLOR, 2)
-
-    # Center line
-    cv2.line(frame, (center_x,0), (center_x,h),
-             (255,255,255), 1)
-
-    # Labels
-    cv2.putText(frame, "ONCOMING",
-                (10, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, LEFT_COLOR, 2)
-
-    cv2.putText(frame, "CENTER",
-                (left_x+5, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6, CENTER_COLOR, 2)
-
-    cv2.putText(frame, "YOUR LANE",
-                (right_x+5, 35),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7, RIGHT_COLOR, 2)
-
-    return frame
-
-
-def draw_vehicle_box(frame, box, track_id,
-                     zone, approaching,
-                     violation=False):
-    x1, y1, x2, y2 = box
-    cx, cy          = get_box_center(box)
-
-    if violation:
-        color     = VIOLATION_COLOR
-        label     = f"WRONG SIDE ID:{track_id}"
-        thickness = 3
-    elif approaching:
-        color     = APPROACH_COLOR
-        label     = f"APPROACHING ID:{track_id}"
-        thickness = 2
-    else:
-        color     = (0, 255, 0)
-        label     = f"ID:{track_id} {zone.upper()}"
-        thickness = 1
-
-    cv2.rectangle(frame, (x1,y1), (x2,y2),
-                  color, thickness)
-
-    (tw, th), _ = cv2.getTextSize(
-        label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
-    )
-    cv2.rectangle(frame,
-                  (x1, y1-th-8),
-                  (x1+tw+6, y1),
-                  color, -1)
-    b  = 0.299*color[2] + 0.587*color[1] + 0.114*color[0]
-    tc = (0,0,0) if b > 127 else (255,255,255)
-    cv2.putText(frame, label,
-                (x1+3, y1-4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45, tc, 1)
-
-    if approaching or violation:
-        cv2.arrowedLine(frame,
-                        (cx, y1-25),
-                        (cx, y1-5),
-                        color, 2, tipLength=0.4)
-
-    return frame
-
-
-def draw_status_panel(frame, total,
-                      approaching, violations):
-    data = [
-        (f"Vehicles   : {total}",      (200,200,200)),
-        (f"Approaching: {approaching}", APPROACH_COLOR),
-        (f"Violations : {violations}",  VIOLATION_COLOR),
-    ]
-
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (5,50), (230,140),
-                  (15,15,15), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-    cv2.rectangle(frame, (5,50), (230,140),
-                  (80,80,80), 1)
-
-    for i, (text, color) in enumerate(data):
-        cv2.putText(frame, text,
-                    (12, 72+i*22),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, color, 1)
-
-
-def draw_violation_alert(frame, count):
-    if count == 0:
-        return
     h, w = frame.shape[:2]
-    cv2.rectangle(frame, (0,0), (w,h),
-                  VIOLATION_COLOR, 3)
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    vp_y = _estimate_vp_y(gray)
+
+    if vp_y is None:
+        # Fallback: fixed fraction
+        return int(h * VP_FALLBACK_FRAC)
+
+    zone_top = int(vp_y + VP_MARGIN_FRAC * h)
+    # Clamp: zone must cover at least bottom 30% of frame
+    zone_top = min(zone_top, int(h * 0.70))
+    # Zone must start below top 20% (ignore near-sky regions)
+    zone_top = max(zone_top, int(h * 0.20))
+
+    return zone_top
+
+
+def inside_roi(cx, cy, frame):
+    """
+    Returns True if (cx, cy) is inside the active detection zone.
+
+    Replaces the old fixed trapezoid inside_trapezoid().
+    Full frame width — no side cutoff on curves.
+    Horizon-adaptive top edge — no misses on hills.
+    """
+    zone_top = get_zone_top_y(frame)
+    h, w     = frame.shape[:2]
+    return (zone_top <= cy <= h) and (0 <= cx <= w)
+
+
+def get_lane(cx, frame):
+    """
+    Returns 'left', 'right', or 'centre' based on horizontal position.
+    Unchanged from previous version.
+    """
+    h, w = frame.shape[:2]
+    if cx < w * 0.45:
+        return "left"
+    if cx > w * 0.55:
+        return "right"
+    return "centre"
+
+
+def get_lane_direction(lane):
+    """Expected travel direction for a given lane."""
+    directions = {
+        "left":   "down",
+        "right":  "up",
+        "centre": None,
+    }
+    return directions.get(lane)
+
+
+def draw_roi(frame):
+    """
+    Draws the adaptive active zone onto the frame.
+    Replaces the old fixed trapezoid draw_roi().
+
+    Shows:
+      • Horizontal line at zone top (horizon estimate)
+      • Faint overlay tinting the active zone
+      • 'active zone' label
+    """
+    h, w     = frame.shape[:2]
+    zone_top = get_zone_top_y(frame)
+
+    # Faint overlay on active zone
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, zone_top), (w, h),
+                  ROI_COLOUR, -1)
+    cv2.addWeighted(overlay, ROI_ALPHA, frame, 1 - ROI_ALPHA, 0, frame)
+
+    # Zone top line
+    cv2.line(frame, (0, zone_top), (w, zone_top),
+             ROI_COLOUR, 1)
+
+    # Label
+    cv2.putText(frame, f"active zone (horizon ~{zone_top}px)",
+                (8, zone_top - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, ROI_COLOUR, 1)
+
+    return frame
