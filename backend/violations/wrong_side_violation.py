@@ -89,15 +89,15 @@ P = _PROFILES[ACTIVE_PROFILE]
 # P1: minimum bbox area as fraction of total frame area
 # 0.08 = vehicle must fill at least 8% of frame
 # Raise to 0.12 to be stricter, lower to 0.05 to catch smaller vehicles
-PROX_MIN_AREA_FRAC = 0.10
+PROX_MIN_AREA_FRAC = 0.12
 
 # P2: centroid must be in lower this fraction of frame (soft signal)
 # 0.60 means centroid y > 40% from top
 # Kept as soft (1pt only) because camera angle varies
-PROX_LOWER_FRAC    = 0.55
+PROX_LOWER_FRAC    = 0.65
 
 # P3: area must have grown by at least this ratio over last N frames
-PROX_GROWTH_RATIO  = 1.04   # 5% growth = closing in
+PROX_GROWTH_RATIO  = 1.1   # 5% growth = closing in
 PROX_GROWTH_FRAMES = 5      # compare latest area vs N frames ago
 
 # Minimum proximity score to proceed to violation logic (max possible = 5)
@@ -220,7 +220,7 @@ def _proximity_score(tid, cx, cy, smooth_area, frame_w, frame_h):
 # to still be considered "in our path" (not passing us laterally).
 # Opposite-lane vehicles passing us move much more than this.
 # Raise if wrong-way vehicles on wide roads are being missed.
-LATERAL_DRIFT_MAX = 0.12   # fraction of frame width
+LATERAL_DRIFT_MAX = 0.12  # fraction of frame width
 
 
 def _check_signals(tid, cx, frame_w, ego_mag, ego_stopped):
