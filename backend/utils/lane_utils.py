@@ -45,6 +45,7 @@ if the current frame's estimation fails.
 import cv2
 import numpy as np
 from collections import deque
+from utils.draw import blend_rect
 
 # ══════════════════════════════════════════════════════════
 #  CONFIG
@@ -111,7 +112,7 @@ def _estimate_vp_y(frame_gray):
      _prev_gray_vp = curr
      return _vp_y_smooth
 
-    p1, st, _ = cv2.calcOpticalFlowPyrLK(_prev_gray_vp, curr, p0, prev)
+    p1, st, _ = cv2.calcOpticalFlowPyrLK(prev, curr, p0, None)
     
     _prev_gray_vp = curr
    
@@ -244,10 +245,7 @@ def draw_roi(frame):
     zone_top = get_zone_top_y(frame)
 
     # Faint overlay on active zone
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, zone_top), (w, h),
-                  ROI_COLOUR, -1)
-    cv2.addWeighted(overlay, ROI_ALPHA, frame, 1 - ROI_ALPHA, 0, frame)
+    blend_rect(frame, 0, zone_top, w, h, ROI_COLOUR, ROI_ALPHA)
 
     # Zone top line
     cv2.line(frame, (0, zone_top), (w, zone_top),

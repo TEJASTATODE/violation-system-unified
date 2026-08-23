@@ -1,4 +1,34 @@
 import cv2
+import numpy as np
+
+
+def blend_rect(frame, x1, y1, x2, y2, color, alpha):
+    """
+    Alpha-blends a filled rectangle into `frame` in place, touching only the
+    pixels inside (x1,y1)-(x2,y2).
+
+    The common pattern elsewhere was `overlay = frame.copy(); cv2.rectangle(
+    overlay, ...); cv2.addWeighted(overlay, alpha, frame, 1-alpha, 0, frame)`
+    — that copies and blends the ENTIRE frame just to tint a small HUD panel
+    or zone. Outside the rectangle the math is a no-op (alpha*px + (1-alpha)*px
+    == px), so it's wasted work — real cost on a CPU-only real-time pipeline
+    already running 5 YOLO models per frame. This produces the identical
+    output, only over the actual rectangle's pixels.
+    """
+    # cv2.rectangle treats (x1,y1)-(x2,y2) as inclusive on both corners;
+    # match that exactly (+1 on the slice end) so this is a true drop-in
+    # replacement regardless of whether a caller's x2/y2 is an interior
+    # coordinate or the frame edge — an excl-end slice here silently left a
+    # 1px unblended strip along the right/bottom edge of every panel that
+    # didn't happen to end exactly at the frame boundary.
+    h, w = frame.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w - 1, int(x2)), min(h - 1, int(y2))
+    if x2 < x1 or y2 < y1:
+        return
+    roi = frame[y1:y2 + 1, x1:x2 + 1]
+    overlay = np.full_like(roi, color)
+    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, roi)
 
 
 def draw_box(frame, box, color=(0, 255, 0), label=None, thickness=1):

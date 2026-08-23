@@ -44,6 +44,7 @@ import numpy as np
 from collections import defaultdict, deque
 from detection.detect import detect_general_objects
 from utils.lane_utils import inside_roi
+from utils.draw import blend_rect
 
 # ══════════════════════════════════════════════════════════
 #  ROAD PROFILE
@@ -168,7 +169,7 @@ def _estimate_ego(prev_gray, curr_gray):
         dx = float(np.median(p1g[inl, 0] - p0g[inl, 0]))
         dy = float(np.median(p1g[inl, 1] - p0g[inl, 1]))
 
-        raw = abs(dy)/scale
+    raw = abs(dy)/scale
     _ego_motion = EGO_EMA_ALPHA * raw + (1 - EGO_EMA_ALPHA) * _ego_motion
     return _ego_motion
 
@@ -300,7 +301,7 @@ def _check_signals(tid, cx, frame_w, ego_mag, ego_stopped):
 # ══════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════
-def process_frame(frame, prev_frame):
+def process_frame(frame, prev_frame, general_dets=None):
     global _frame_idx, _prev_gray
 
     _frame_idx += 1
@@ -315,8 +316,9 @@ def process_frame(frame, prev_frame):
     ego_mag     = _estimate_ego(prev_gray, curr_gray)
     ego_stopped = ego_mag < EGO_STOPPED_PX
 
-    detections = detect_general_objects(frame)
+    detections = general_dets if general_dets is not None else detect_general_objects(frame)
     out = frame.copy()
+    violations = []
 
     for det in detections:
         tid = det.get("track_id", -1)
@@ -456,6 +458,11 @@ def process_frame(frame, prev_frame):
         if violation:
             _draw_active(out, x1, y1, x2, y2, tid, score,
                          True, sig_a, sig_b, sig_c, _cx_history[tid])
+            violations.append({
+                "box": (int(x1), int(y1), int(x2), int(y2)),
+                "track_id": tid,
+                "score": score,
+            })
         elif confirmed_correct:
             _draw_correct(out, x1, y1, x2, y2, tid)
         # else: ambiguous — draw nothing (cleanest output)
@@ -474,7 +481,20 @@ def process_frame(frame, prev_frame):
                           _score, _violation, _correct):
                 store.pop(t, None)
 
-    return out
+    return out, violations
+
+
+def reset_wrong_side_state():
+    """Clears all module-level tracking state (parity with HelmetViolationDetector.reset())."""
+    global _frame_idx, _prev_gray, _ego_motion
+
+    for store in (_cx_history, _cy_history, _area_history, _smooth_area,
+                  _track_age, _last_seen, _score, _violation, _correct):
+        store.clear()
+
+    _frame_idx  = 0
+    _prev_gray  = None
+    _ego_motion = 0.0
 
 
 # ══════════════════════════════════════════════════════════
@@ -637,9 +657,7 @@ def _draw_active(frame, x1, y1, x2, y2, tid, score,
 def _draw_zone(frame, w, h):
     """Subtle lane danger-zone overlay — drawn before HUD."""
     danger_x = int(P["lane_danger_left"] * w)
-    overlay  = frame.copy()
-    cv2.rectangle(overlay, (danger_x, 0), (w, h), (20, 20, 180), -1)
-    cv2.addWeighted(overlay, 0.04, frame, 0.96, 0, frame)
+    blend_rect(frame, danger_x, 0, w, h, (20, 20, 180), 0.04)
     # Single pixel vertical divider
     cv2.line(frame, (danger_x, 0), (danger_x, h), (60, 60, 200), 1)
 
@@ -664,10 +682,7 @@ def _draw_hud(frame, ego_mag, ego_stopped):
     # Panel background
     panel_w = 300
     panel_h = pad_y * 2 + line_h * len(lines)
-    overlay  = frame.copy()
-    cv2.rectangle(overlay, (6, 6), (6 + panel_w, 6 + panel_h),
-                  (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+    blend_rect(frame, 6, 6, 6 + panel_w, 6 + panel_h, (20, 20, 20), 0.55)
 
     for i, txt in enumerate(lines):
         cv2.putText(frame, txt,

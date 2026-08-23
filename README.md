@@ -6,8 +6,13 @@ This project is a computer vision system for detecting traffic safety violations
 
 - wrong-side driving
 - helmet violations
+- triple riding (more than two riders on a two-wheeler)
+- signal jumping (red-light running, confirmed via stop-then-move state machine)
+- exhaust/smoke-emission (live detection overlay only — see note below)
 
-The system is built as a Python backend using FastAPI and Ultralytics YOLO models.
+The system is built as a Python backend using FastAPI and Ultralytics YOLO models. All five detectors above run together in a single unified pipeline over one video feed — see [Running the Unified Pipeline](#running-the-unified-pipeline).
+
+Smoke-emission detection is a live overlay only, not a confirmed violation: the model localizes the exhaust region per frame, but smoke-density scoring and violation confirmation/evidence-saving are not yet implemented (no confirm-over-N-frames gate, unlike the other four types).
 
 ## Tech Stack
 
@@ -32,6 +37,7 @@ requirements.txt
 README.md
 backend/
   main.py
+  run_pipeline.py        ← unified multi-violation entry point
   test.py
   test_helmet.py
   test_wrong_side.py
@@ -41,15 +47,27 @@ backend/
   violations/
     helmet_violation.py
     wrong_side_violation.py
+    triple_riding_violation.py
+    signal_jump_violation.py
+    smoke_emission_violation.py   ← pass-through only, no confirm/evidence logic
   utils/
     draw.py
+    evidence.py           ← shared evidence-saving used by all violation types
     lane_utils.py
     math_utils.py
     motion_utils.py
-models/
-  helmet_best.pt
-  yolov8n.pt
-  yolo11n.pt
+  models/
+    helmet_best.pt
+    triple_riding_best.pt
+    signal.pt
+    smoke_best.pt
+    yolov8n.pt
+    yolo11n.pt
+  evidence/
+    wrong_side/
+    helmet/
+    triple_riding/
+    signal_jump/
 ```
 
 ## System Architecture
@@ -265,6 +283,22 @@ Thresholds adapt to rider size:
 Once a rider is classified as `violation` or `safe`, the decision is locked for `LOCK_TTL = 5` seconds.
 This stabilizes output in noisy or temporary frames.
 
+### Triple Riding Violation Workflow
+
+The triple-riding detection logic lives in `backend/violations/triple_riding_violation.py`, backed by a custom-trained single-class model (`models/triple_riding_best.pt`, class 0 = "more than two persons on a two-wheeler") run with tracking via `detection.detect.detect_triple_riding_objects(frame)`.
+
+#### 1. Detection
+
+The model is run with `.track()` (ByteTrack) rather than a bare `.predict()` call, so each detection carries a `track_id` — this is what makes multi-frame confirmation possible.
+
+#### 2. Confirmation
+
+Mirrors the helmet detector's pattern: a track must show the violation on `CONFIRM_MAJORITY = 2` of the last `CONFIRM_FRAMES = 3` detection calls before it's confirmed. This avoids saving evidence on a single noisy frame.
+
+#### 3. Lock and TTL
+
+Once confirmed, a track stays "locked" and is reported on every subsequent call until it hasn't been seen for `LOCK_TTL = 5` seconds — same TTL pattern as helmet detection.
+
 ## Key Formulas
 
 ### Area and Growth
@@ -316,13 +350,34 @@ uvicorn backend.main:app --reload
 
 Open `http://127.0.0.1:8000/`
 
+`backend/main.py` currently exposes only a health-check endpoint — it is not yet wired to the detection pipeline. See below for how to actually run detection.
+
+## Running the Unified Pipeline
+
+`backend/run_pipeline.py` is the primary way to run detection today. It opens a single video feed and runs wrong-side, helmet, triple-riding, signal-jump, and smoke-emission detection together in one loop, with a combined on-screen overlay and per-type evidence saving.
+
+```powershell
+cd backend
+python run_pipeline.py
+```
+
+- Point `VIDEO_PATH` at the top of the file to any local video (`test_videos/` has several `testN.mp4` clips for trying different violation types). Signal-jump needs an intersection clip with a visible traffic light to produce any detections; smoke-emission needs a visibly smoking vehicle — on other clips they'll simply report zero, which is expected.
+- Evidence crops are saved to `backend/evidence/{wrong_side,helmet,triple_riding,signal_jump}/`, deduplicated per tracked vehicle/rider. Smoke-emission does not save evidence (see note above — it's a live overlay only).
+- Controls: `ESC` quits, `SPACE` pauses, `R` resets all detector state (smoke-emission is stateless, nothing to reset).
+- General detection, wrong-side, and signal-jump run every frame (both wrong-side's optical-flow/ego-motion state and signal-jump's Lucas-Kanade stillness check need consecutive frames). Helmet, triple-riding, and smoke-emission run every 3rd frame (`FRAME_SKIP`), with a short on-screen hold so helmet boxes don't flicker between detection calls.
+
+`backend/test_wrong_side.py` and `backend/test_helmet.py` remain available for isolating and tuning a single detector without the rest of the pipeline running.
+
 ## Notes
 
-- The current `backend/main.py` exposes a simple health endpoint only.
 - The core detection logic is implemented in `backend/detection/` and `backend/violations/`.
 - `backend/utils/lane_utils.py` contains the adaptive horizon ROI logic.
+- `backend/utils/evidence.py` contains the shared, per-violation-type evidence recorder used by `run_pipeline.py`.
 - `backend/violations/wrong_side_violation.py` contains the adaptive, score-based wrong-way violation algorithm.
 - `backend/violations/helmet_violation.py` contains the helmet detection and rider pairing logic.
+- `backend/violations/triple_riding_violation.py` contains the triple-riding detection and confirmation logic.
+- `backend/violations/signal_jump_violation.py` contains the three-gate (red signal → confirmed stopped → moved) signal-jump state machine, including its own Lucas-Kanade optical-flow stillness check. Tuned against 960×540 frames originally; may behave slightly differently at other resolutions since `run_pipeline.py` doesn't resize.
+- `backend/violations/smoke_emission_violation.py` is a pass-through — the underlying model only localizes an exhaust region per frame; there's no smoke-density scoring or confirmation logic yet.
 
 ## Recommended Improvements
 
@@ -330,6 +385,8 @@ Open `http://127.0.0.1:8000/`
 - Add a front-end or visualization layer for live alerts.
 - Add unit/integration tests for the violation thresholds and decision logic.
 - Document supported YOLO classes and label mapping.
+- Implement real smoke-density scoring and a confirm-over-N-frames gate for smoke-emission, so it can graduate from live overlay to a confirmed, evidenced violation type like the other four.
+- Investigate per-frame throughput — running up to 5 YOLO models per frame is CPU-heavy; consider smaller `imgsz`, ONNX/OpenVINO export, or GPU inference for closer-to-real-time performance.
 
 ## License
 

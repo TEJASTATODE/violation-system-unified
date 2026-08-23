@@ -6,7 +6,13 @@ from time import time
 # ── Confidence thresholds ─────────────────────────────────────────────────────
 GENERAL_CONF    = 0.30
 HELMET_CONF     = 0.35
-MIN_SCORE       = 0.02
+# Was 0.02 — low enough that a rider with ZERO no-helmet evidence but only a
+# marginal/spurious with-helmet overlap (bleed from a neighboring rider,
+# model jitter) got classified "safe" instead of "no decision", verified via
+# _make_decision(with_score=0.03, without_score=0.0) -> ("safe", 0.03).
+# Raised so weak, noise-level overlaps fall through to no-decision instead of
+# confidently asserting "safe".
+MIN_SCORE       = 0.12
 
 # ── Minimum rider size ────────────────────────────────────────────────────────
 MIN_RIDER_HEIGHT = 40
@@ -35,20 +41,25 @@ class HelmetViolationDetector:
                  lock_ttl: float = LOCK_TTL,
                  confirm_frames: int = CONFIRM_FRAMES,
                  confirm_majority: int = CONFIRM_MAJORITY,
-                 min_rider_h: int = MIN_RIDER_HEIGHT,
-                 min_rider_w: int = MIN_RIDER_WIDTH):
+                 min_rider_h: int | None = None,
+                 min_rider_w: int | None = None):
 
         self.frame_w          = frame_w
         self.frame_h          = frame_h
         self.lock_ttl         = lock_ttl
         self.confirm_frames   = confirm_frames
         self.confirm_majority = confirm_majority
-        self.min_rider_h      = min_rider_h
-        self.min_rider_w      = min_rider_w
+        # Resolution-independent defaults: MIN_RIDER_HEIGHT/WIDTH were fixed pixel
+        # values tuned against one particular camera's resolution. A dashcam's
+        # actual resolution isn't fixed yet, so derive the gate from frame_h
+        # instead — behaves consistently whether the feed is 720p or 4K.
+        self.min_rider_h = min_rider_h if min_rider_h is not None else max(24, int(frame_h * 0.035))
+        self.min_rider_w = min_rider_w if min_rider_w is not None else max(10, int(frame_w * 0.012))
 
         self._locked_riders: dict = {}
         self._pending: dict       = defaultdict(list)
         self._prev_size: dict     = {}
+        self._last_seen: dict     = {}   # key -> ts, for reaping stale never-confirmed riders
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -60,7 +71,7 @@ class HelmetViolationDetector:
         if current_time is None:
             current_time = time()
 
-        self._expire_stale_locks(current_time)
+        self._expire_stale(current_time)
 
         persons, motorcycles, with_helmet, without_helmet = \
             self._parse_detections(general_detections, helmet_detections)
@@ -90,6 +101,8 @@ class HelmetViolationDetector:
             head_box = get_head_box(rider["box"],
                                     frame_w=self.frame_w,
                                     frame_h=self.frame_h)
+
+            self._last_seen[key] = current_time
 
             prev_h     = self._prev_size.get(key, rider_h)
             is_growing = rider_h > prev_h * 1.05
@@ -152,15 +165,28 @@ class HelmetViolationDetector:
         self._locked_riders.clear()
         self._pending.clear()
         self._prev_size.clear()
+        self._last_seen.clear()
         print("Reset all decisions.")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _expire_stale_locks(self, current_time: float) -> None:
-        stale = [k for k, v in self._locked_riders.items()
-                 if current_time - v["ts"] > self.lock_ttl]
+    def _expire_stale(self, current_time: float) -> None:
+        """
+        Reap any rider key not seen for lock_ttl seconds — from _locked_riders,
+        AND from _pending/_prev_size, which previously only got cleaned up if a
+        rider reached a locked decision. A rider seen briefly but never
+        confirmed (the common case for most passing traffic) used to leave a
+        permanent entry in _pending/_prev_size, growing unbounded over a long
+        real-time session. Keyed off _last_seen so this covers every rider,
+        confirmed or not.
+        """
+        stale = [k for k, ts in self._last_seen.items()
+                 if current_time - ts > self.lock_ttl]
         for k in stale:
-            del self._locked_riders[k]
+            self._locked_riders.pop(k, None)
+            self._pending.pop(k, None)
+            self._prev_size.pop(k, None)
+            self._last_seen.pop(k, None)
             self._pending.pop(k, None)
             self._prev_size.pop(k, None)
 
