@@ -72,6 +72,44 @@ backend/
 
 ## System Architecture
 
+One video frame is decoded once, then fanned out to five independent violation modules that each read the same normalized detections on their own cadence — some every frame (they need continuous optical flow), some every 3rd frame (spatial matches only, traded for throughput on CPU-only inference). All five converge on one shared evidence recorder and one shared draw/HUD service.
+
+```mermaid
+flowchart TD
+    subgraph ORCH["Orchestrator — run_pipeline.py (per-frame loop, fault isolation)"]
+        FRAME[Video frame] --> DET
+
+        subgraph DET["Detection Layer"]
+            DL1["yolo_model.py — 6 YOLO weights"]
+            DL2["detect.py — normalizes every model's output to {box, track_id, conf, class}"]
+            DL1 --> DL2
+        end
+
+        DET --> WS["Wrong-Side<br/>every frame<br/>ego-motion flow + horizon ROI + hysteresis score"]
+        DET --> HM["Helmet<br/>every 3rd frame<br/>rider–bike pair + head-box match"]
+        DET --> TR["Triple-Riding<br/>every 3rd frame<br/>confirm-over-N + lock + TTL"]
+        DET --> SJ["Signal-Jump<br/>every frame<br/>3-gate: red confirmed → stopped → moved"]
+        DET --> SM["Smoke-Emission<br/>every 3rd frame<br/>confirm-over-N + lock + TTL"]
+
+        WS --> EV["evidence.py<br/>dedup by key + expiry sweep + crop"]
+        HM --> EV
+        TR --> EV
+        SJ --> EV
+        SM --> EV
+
+        WS --> DR["draw.py<br/>region-only blend + combined HUD"]
+        HM --> DR
+        TR --> DR
+        SJ --> DR
+        SM --> DR
+    end
+
+    EV --> OUT1[("evidence/&lt;type&gt;/*.jpg")]
+    DR --> OUT2["Live annotated video"]
+```
+
+The "confirm → lock → reap" shape above (pending buffer of recent calls → majority reached → locked, re-fires until unseen past its TTL → reaped from memory) is shared by helmet, triple-riding, signal-jump, and smoke-emission — first written for triple-riding and reused for the other three. Wrong-side is the one exception: it accumulates a continuously decaying score per tracked vehicle instead of confirming a single detection, with its own periodic reap sweep that the TTL pattern above was later brought in line with.
+
 ### 1. Input
 
 The system consumes video frames from a dashcam or video source.
