@@ -14,3 +14,5 @@ pydantic
 requests
 scipy
 matplotlib
+pyserial
+pynmea2

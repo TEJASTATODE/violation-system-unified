@@ -1,5 +1,8 @@
 import cv2
+import logging
+import os
 import time
+from pathlib import Path
 
 from detection.detect import (
     detect_general_objects,
@@ -16,6 +19,12 @@ from violations.smoke_emission_violation import SmokeEmissionDetector
 from utils.lane_utils import draw_roi
 from utils.draw import draw_box, blend_rect
 from utils.evidence import EvidenceRecorder, ensure_evidence_dirs
+from config import GPS_BAUD, GPS_ENABLED, GPS_MAX_AGE_S, GPS_PORT
+from sensors.gps import GPSFix, GPSReader
+
+
+log = logging.getLogger(__name__)
+HEADLESS = os.getenv("HEADLESS", "0") == "1"
 
 # ── Config ────────────────────────────────────────────────────────────────
 VIDEO_PATH = r"C:\Users\TEJAS\OneDrive\Desktop\Miniproject\test_videos\test20.mp4"
@@ -29,6 +38,11 @@ SMOKE_COLOR  = (0, 140, 255)   # orange — confirmed smoke-emission violation b
 
 # ── Setup ─────────────────────────────────────────────────────────────────
 ensure_evidence_dirs()
+gps = GPSReader(GPS_PORT, GPS_BAUD, GPS_MAX_AGE_S).start() if GPS_ENABLED else None
+try:
+    clock_source = Path("/run/clock_source").read_text(encoding="utf-8").strip() or "unknown"
+except OSError:
+    clock_source = "unknown"
 recorders = {
     "wrong_side":     EvidenceRecorder("wrong_side"),
     "helmet":         EvidenceRecorder("helmet"),
@@ -147,7 +161,7 @@ def draw_display_boxes(frame) -> None:
         draw_box(frame, [int(c) for c in db["box"]], color=db["color"], label=db["label"])
 
 
-def draw_combined_hud(frame, fps: float, counts: dict) -> None:
+def draw_combined_hud(frame, fps: float, counts: dict, gps_fix: GPSFix | None = None) -> None:
     lines = [
         f"FPS: {fps:.1f}",
         f"Wrong-side: {counts['wrong_side']}",
@@ -156,6 +170,11 @@ def draw_combined_hud(frame, fps: float, counts: dict) -> None:
         f"Signal jump: {counts['signal_jump']}",
         f"Smoke emission: {counts['smoke_emission']}",
     ]
+    if not HEADLESS and gps_fix is not None:
+        if gps_fix.valid:
+            lines.append(f"GPS: {gps_fix.satellites} sats, {gps_fix.speed_kmh or 0.0:.1f} km/h")
+        else:
+            lines.append("GPS: no fix")
     blend_rect(frame, frame.shape[1] - 210, 6, frame.shape[1] - 6, 6 + 20 * len(lines) + 10,
                (18, 18, 18), 0.55)
     for i, txt in enumerate(lines):
@@ -197,7 +216,10 @@ try:
             (frame.copy(), []),
         )
         for v in wrong_side_viol:
-            recorders["wrong_side"].maybe_save(raw_frame, v["box"], frame_count, v["track_id"])
+            recorders["wrong_side"].maybe_save(
+                raw_frame, v["box"], frame_count, v["track_id"],
+                fix=gps.get() if gps else GPSFix(), clock_source=clock_source,
+            )
 
         signal_dets = safe_call("signal_detect", lambda: detect_signal_objects(frame), [])
         last_signal_viol, signal_color, signal_stop_y, signal_buffer_y, _signal_all = safe_call(
@@ -206,7 +228,10 @@ try:
             (last_signal_viol, signal_color, signal_stop_y, signal_buffer_y, {}),
         )
         for v in last_signal_viol:
-            recorders["signal_jump"].maybe_save(raw_frame, v["bbox"], frame_count, v["tid"])
+            recorders["signal_jump"].maybe_save(
+                raw_frame, v["bbox"], frame_count, v["tid"],
+                fix=gps.get() if gps else GPSFix(), clock_source=clock_source,
+            )
 
         # ── every FRAME_SKIP frames: helmet + triple-riding + smoke-emission (tolerant to gaps) ──
         if frame_count % FRAME_SKIP == 0:
@@ -219,7 +244,9 @@ try:
             for v in last_helmet_viol:
                 bike = nearest_bike(v["rider_box"], last_general)
                 recorders["helmet"].maybe_save(raw_frame, v["rider_box"], frame_count,
-                                                v.get("track_id", -1), extra_box=bike)
+                                                v.get("track_id", -1), extra_box=bike,
+                                                fix=gps.get() if gps else GPSFix(),
+                                                clock_source=clock_source)
 
             triple_dets = safe_call("triple_detect", lambda: detect_triple_riding_objects(frame), [])
             last_triple_viol = safe_call(
@@ -228,7 +255,10 @@ try:
                 last_triple_viol,
             )
             for v in last_triple_viol:
-                recorders["triple_riding"].maybe_save(raw_frame, v["box"], frame_count, v["track_id"])
+                recorders["triple_riding"].maybe_save(
+                    raw_frame, v["box"], frame_count, v["track_id"],
+                    fix=gps.get() if gps else GPSFix(), clock_source=clock_source,
+                )
 
             smoke_dets = safe_call("smoke_detect", lambda: detect_smoke_objects(frame), [])
             last_smoke_viol = safe_call(
@@ -237,7 +267,10 @@ try:
                 last_smoke_viol,
             )
             for v in last_smoke_viol:
-                recorders["smoke_emission"].maybe_save(raw_frame, v["box"], frame_count, v.get("track_id", -1))
+                recorders["smoke_emission"].maybe_save(
+                    raw_frame, v["box"], frame_count, v.get("track_id", -1),
+                    fix=gps.get() if gps else GPSFix(), clock_source=clock_source,
+                )
 
         update_display_boxes(last_helmet_viol, last_helmet_safe)
 
@@ -268,12 +301,13 @@ try:
             "triple_riding":  len(last_triple_viol),
             "signal_jump":    len(last_signal_viol),
             "smoke_emission": len(last_smoke_viol),
-        })
+        }, gps.get() if gps else GPSFix())
 
-        cv2.imshow("Unified Dashcam Pipeline", canvas)
+        if not HEADLESS:
+            cv2.imshow("Unified Dashcam Pipeline", canvas)
         prev_frame = raw_frame
 
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFF if not HEADLESS else -1
         if key == 27:                    # ESC — quit
             break
         elif key == 32:                  # SPACE — pause
@@ -291,4 +325,7 @@ try:
 
 finally:
     cap.release()
-    cv2.destroyAllWindows()
+    if gps:
+        gps.stop()
+    if not HEADLESS:
+        cv2.destroyAllWindows()
