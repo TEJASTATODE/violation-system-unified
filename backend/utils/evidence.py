@@ -1,10 +1,14 @@
 import cv2
+import logging
 import os
 from datetime import datetime
+
+from utils.evidence_meta import write_meta
 
 EVIDENCE_ROOT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "evidence"
 )
+log = logging.getLogger(__name__)
 
 VIOLATION_TYPES = ("wrong_side", "helmet", "triple_riding", "signal_jump", "smoke_emission")
 
@@ -49,7 +53,7 @@ class EvidenceRecorder:
         self._saved.clear()
 
     def maybe_save(self, frame, box, frame_count: int, track_id: int = -1,
-                    extra_box=None):
+                    extra_box=None, fix=None, clock_source: str = "unknown"):
         """extra_box: e.g. nearest bike box for helmet, unioned into the crop."""
         key = make_key(box, track_id)
         if key in self._saved:
@@ -58,6 +62,8 @@ class EvidenceRecorder:
         path = self._save_crop(frame, box, extra_box)
         if path:
             self._saved[key] = frame_count
+            if fix is not None:
+                write_meta(path, self.violation_type, fix, clock_source)
         return path
 
     def _save_crop(self, frame, box, extra_box):
@@ -79,5 +85,5 @@ class EvidenceRecorder:
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(self.dir, f"{self.violation_type}_{ts}.jpg")
         cv2.imwrite(path, crop)
-        print(f"[EVIDENCE] {path}")
+        log.info("Evidence saved: %s", path)
         return path

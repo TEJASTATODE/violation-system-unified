@@ -1,0 +1,15 @@
+[Unit]
+Description=Traffic violation detection pipeline
+After=gps-timesync.service
+Requires=gps-timesync.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/violation-system-unified/backend
+Environment=HEADLESS=1
+ExecStart=/home/pi/violation-system-unified/venv/bin/python run_pipeline.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

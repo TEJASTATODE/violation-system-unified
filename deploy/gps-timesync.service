@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync system clock and RTC from GPS when offline
+After=multi-user.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/pi/violation-system-unified/backend
+ExecStart=/home/pi/violation-system-unified/venv/bin/python -m sensors.time_sync
+User=root
+
+[Install]
+WantedBy=multi-user.target
